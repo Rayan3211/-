@@ -1,0 +1,6 @@
+{
+  "name": "الراوي الوثائقي: هدنة مودروس",
+  "description": "تطبيق استماع وثائقي تفاعلي بصوت راوٍ رخيم وفخم بالعربية الفصحى مع تلاوة نص وثائقي هدنة مودروس التاريخي بجودة إذاعية.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
