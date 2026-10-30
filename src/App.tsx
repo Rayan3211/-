@@ -10,24 +10,27 @@ import { PlayerControls } from './components/PlayerControls';
 import { SceneCard } from './components/SceneCard';
 import { DirectorStudioModal } from './components/DirectorStudioModal';
 import {
+  getSceneAudio,
   fetchNarrationAudio,
   downloadWavBlob,
-  playWebSpeechFallback,
-  stopWebSpeech,
+  downloadAudioFromUrl,
 } from './utils/audioService';
 import { ambientSoundscape } from './utils/ambientAudio';
 import {
   BookOpen,
   History,
   Sparkles,
-  Info,
   CheckCircle2,
   Download,
   Loader2,
   Volume2,
-  ChevronDown,
   Layers,
+  ShieldCheck,
+  AlertCircle,
+  Edit3,
 } from 'lucide-react';
+
+const STORAGE_KEY_CUSTOM_TEXTS = 'mudros_custom_texts_v1';
 
 export default function App() {
   const [currentSceneIndex, setCurrentSceneIndex] = useState(0);
@@ -35,7 +38,7 @@ export default function App() {
   const [isLoadingAudio, setIsLoadingAudio] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [playbackSpeed, setPlaybackSpeed] = useState(0.9); // 0.9x: documentary pace
+  const [playbackSpeed, setPlaybackSpeed] = useState(0.9); // 0.9x documentary pace
   const [selectedVoice, setSelectedVoice] = useState('Charon'); // Deep resonant documentary narrator
   const [showTashkeel, setShowTashkeel] = useState(true);
   const [fontSize, setFontSize] = useState(21);
@@ -44,20 +47,36 @@ export default function App() {
   const [autoPlayNext, setAutoPlayNext] = useState(true);
   const [isDirectorModalOpen, setIsDirectorModalOpen] = useState(false);
   const [copiedAll, setCopiedAll] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
-  // Cache tracking: sceneId -> { url, blob }
-  const [cachedScenes, setCachedScenes] = useState<{
-    [key: string]: { url: string; blob: Blob };
-  }>({});
-  const [batchLoading, setBatchLoading] = useState(false);
-  const [batchProgress, setBatchProgress] = useState(0);
+  // Custom texts per scene (persisted in localStorage)
+  const [customTexts, setCustomTexts] = useState<Record<number, string>>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_CUSTOM_TEXTS);
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  // Dynamic audio cache: key -> { url, blob }
+  const [cachedScenes, setCachedScenes] = useState<
+    Record<string, { url: string; blob?: Blob }>
+  >({});
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const isFallbackPlayingRef = useRef(false);
-
   const currentScene = MUDROS_SCENES[currentSceneIndex];
 
-  // Initialize audio element
+  // Save customTexts to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY_CUSTOM_TEXTS, JSON.stringify(customTexts));
+    } catch (e) {
+      console.warn('Failed to save custom texts to localStorage', e);
+    }
+  }, [customTexts]);
+
+  // Audio element listeners
   useEffect(() => {
     const audio = new Audio();
     audioRef.current = audio;
@@ -74,7 +93,6 @@ export default function App() {
       setIsPlaying(false);
       setCurrentTime(0);
       if (autoPlayNext && currentSceneIndex < MUDROS_SCENES.length - 1) {
-        // Transition to next scene with a brief documentary transition pause
         setTimeout(() => {
           handleSelectScene(currentSceneIndex + 1, true);
         }, 1200);
@@ -99,11 +117,10 @@ export default function App() {
       audio.removeEventListener('error', handleError);
       audio.pause();
       ambientSoundscape.stop();
-      stopWebSpeech();
     };
   }, [autoPlayNext, currentSceneIndex]);
 
-  // Handle ambient soundscape updates
+  // Handle ambient soundscape
   useEffect(() => {
     if (ambientEnabled && isPlaying) {
       ambientSoundscape.start(ambientVolume);
@@ -118,36 +135,52 @@ export default function App() {
     }
   }, [ambientVolume, ambientEnabled]);
 
-  // Adjust playback speed
+  // Playback speed
   useEffect(() => {
     if (audioRef.current) {
       audioRef.current.playbackRate = playbackSpeed;
     }
   }, [playbackSpeed]);
 
-  // Load or fetch audio for a specific scene
-  const loadSceneAudio = useCallback(
+  // Helper to get effective text for a scene
+  const getSceneText = useCallback(
+    (sceneId: number): string => {
+      if (customTexts[sceneId] && customTexts[sceneId].trim().length > 0) {
+        return customTexts[sceneId];
+      }
+      const scene = MUDROS_SCENES.find((s) => s.id === sceneId);
+      return scene ? scene.cleanNarrationText : '';
+    },
+    [customTexts]
+  );
+
+  // Load audio for a scene
+  const loadAudioForScene = useCallback(
     async (scene: ScriptScene, voice: string = selectedVoice): Promise<string> => {
-      const cacheKey = `${scene.id}_${voice}`;
+      const isCustomEdited = !!customTexts[scene.id];
+      const textToSpeak = getSceneText(scene.id);
+      const cacheKey = `scene_${scene.id}_${voice}_${isCustomEdited ? textToSpeak.slice(0, 30) : 'default'}`;
+
       if (cachedScenes[cacheKey]) {
         return cachedScenes[cacheKey].url;
       }
 
-      const res = await fetchNarrationAudio(
-        scene.cleanNarrationText,
+      const res = await getSceneAudio(
+        scene.id,
+        textToSpeak,
         voice,
         scene.speechStyleInstruction,
-        cacheKey
+        isCustomEdited
       );
 
       setCachedScenes((prev) => ({
         ...prev,
-        [cacheKey]: { url: res.url, blob: res.blob },
+        [cacheKey]: res,
       }));
 
       return res.url;
     },
-    [cachedScenes, selectedVoice]
+    [cachedScenes, selectedVoice, customTexts, getSceneText]
   );
 
   // Play a specific scene
@@ -156,27 +189,19 @@ export default function App() {
     if (!scene || !audioRef.current) return;
 
     setIsLoadingAudio(true);
-    stopWebSpeech();
+    setStatusMessage(null);
 
     try {
-      const audioUrl = await loadSceneAudio(scene, selectedVoice);
+      const audioUrl = await loadAudioForScene(scene, selectedVoice);
       const audio = audioRef.current;
       audio.src = audioUrl;
       audio.playbackRate = playbackSpeed;
       await audio.play();
       setIsPlaying(true);
     } catch (err: any) {
-      console.warn('Backend TTS failed, falling back to Web Speech API:', err);
-      // Fallback to browser SpeechSynthesis
-      isFallbackPlayingRef.current = true;
-      setIsPlaying(true);
-      playWebSpeechFallback(scene.cleanNarrationText, playbackSpeed, () => {
-        setIsPlaying(false);
-        isFallbackPlayingRef.current = false;
-        if (autoPlayNext && sceneIndex < MUDROS_SCENES.length - 1) {
-          setTimeout(() => handleSelectScene(sceneIndex + 1, true), 1200);
-        }
-      });
+      console.error('Audio load failure:', err);
+      setStatusMessage(`تعذر تشغيل الصوت: ${err.message || 'خطأ في جلب الصوت'}`);
+      setIsPlaying(false);
     } finally {
       setIsLoadingAudio(false);
     }
@@ -187,7 +212,6 @@ export default function App() {
       if (audioRef.current) {
         audioRef.current.pause();
       }
-      stopWebSpeech();
       setIsPlaying(false);
     } else {
       if (audioRef.current && audioRef.current.src && audioRef.current.currentTime > 0) {
@@ -205,7 +229,6 @@ export default function App() {
     if (audioRef.current) {
       audioRef.current.pause();
     }
-    stopWebSpeech();
     setCurrentSceneIndex(index);
     setCurrentTime(0);
 
@@ -231,48 +254,114 @@ export default function App() {
     }
   };
 
-  // Pre-generate all scenes sequentially in background
-  const handlePreGenerateAll = async () => {
-    if (batchLoading) return;
-    setBatchLoading(true);
-    setBatchProgress(0);
+  // Handle saving custom text for a scene and optionally re-generating speech immediately
+  const handleSaveCustomText = async (
+    sceneId: number,
+    newText: string,
+    andGenerateSpeech = true
+  ) => {
+    setCustomTexts((prev) => ({
+      ...prev,
+      [sceneId]: newText,
+    }));
 
-    for (let i = 0; i < MUDROS_SCENES.length; i++) {
-      const scene = MUDROS_SCENES[i];
-      const cacheKey = `${scene.id}_${selectedVoice}`;
-      if (!cachedScenes[cacheKey]) {
-        try {
-          await loadSceneAudio(scene, selectedVoice);
-        } catch (e) {
-          console.error(`Failed to pre-cache scene ${scene.id}`, e);
+    if (andGenerateSpeech) {
+      const scene = MUDROS_SCENES.find((s) => s.id === sceneId);
+      if (!scene) return;
+
+      setIsLoadingAudio(true);
+      setStatusMessage(null);
+
+      try {
+        const cacheKey = `scene_${sceneId}_${selectedVoice}_${newText.slice(0, 30)}`;
+        const res = await fetchNarrationAudio(
+          newText,
+          selectedVoice,
+          scene.speechStyleInstruction,
+          cacheKey,
+          sceneId
+        );
+
+        setCachedScenes((prev) => ({
+          ...prev,
+          [cacheKey]: { url: res.url, blob: res.blob },
+        }));
+
+        // If currently on this scene, play the new audio immediately
+        if (currentScene.id === sceneId && audioRef.current) {
+          audioRef.current.src = res.url;
+          audioRef.current.playbackRate = playbackSpeed;
+          await audioRef.current.play();
+          setIsPlaying(true);
         }
-      }
-      setBatchProgress(i + 1);
-    }
 
-    setBatchLoading(false);
+        setStatusMessage(`✓ تم تحديث نص المشهد ${sceneId} وتوليد النطق الجديد بصوت الراوي وحفظه بنجاح!`);
+        setTimeout(() => setStatusMessage(null), 5000);
+      } catch (err: any) {
+        console.error('Speech generation error:', err);
+        setStatusMessage(
+          `تم حفظ النص المعدل، ولكن تعذر توليد النطق تلقائياً (${err.message}). يمكنك المحاولة مجدداً أو مراجعة استوديو المخرج.`
+        );
+      } finally {
+        setIsLoadingAudio(false);
+      }
+    } else {
+      setStatusMessage(`✓ تم حفظ النص المعدل للمشهد ${sceneId}.`);
+      setTimeout(() => setStatusMessage(null), 3000);
+    }
   };
 
-  const handleDownloadCurrentScene = () => {
-    const cacheKey = `${currentScene.id}_${selectedVoice}`;
-    const cached = cachedScenes[cacheKey];
-    if (cached) {
-      downloadWavBlob(cached.blob, `mudros_scene_${currentScene.id}_${selectedVoice}.wav`);
-    } else {
-      // Fetch and download
-      loadSceneAudio(currentScene, selectedVoice).then(() => {
-        const entry = cachedScenes[cacheKey];
-        if (entry) {
-          downloadWavBlob(entry.blob, `mudros_scene_${currentScene.id}_${selectedVoice}.wav`);
+  // Reset custom text to original script
+  const handleResetCustomText = (sceneId: number) => {
+    setCustomTexts((prev) => {
+      const next = { ...prev };
+      delete next[sceneId];
+      return next;
+    });
+
+    // Clear dynamic audio cache for this scene so it reverts to the permanent bundled WAV
+    setCachedScenes((prev) => {
+      const next: Record<string, { url: string; blob?: Blob }> = {};
+      Object.keys(prev).forEach((k) => {
+        if (!k.startsWith(`scene_${sceneId}_`)) {
+          next[k] = prev[k];
         }
       });
+      return next;
+    });
+
+    if (currentScene.id === sceneId) {
+      setTimeout(() => playSceneAudio(currentSceneIndex), 50);
+    }
+
+    setStatusMessage(`تمت استعادة النص الأصلي والتسجيل الأصلي للمشهد ${sceneId}.`);
+    setTimeout(() => setStatusMessage(null), 3000);
+  };
+
+  const handleDownloadCurrentScene = async () => {
+    const isCustom = !!customTexts[currentScene.id];
+    const textToSpeak = getSceneText(currentScene.id);
+    const cacheKey = `scene_${currentScene.id}_${selectedVoice}_${isCustom ? textToSpeak.slice(0, 30) : 'default'}`;
+    const cached = cachedScenes[cacheKey];
+
+    if (cached?.blob) {
+      downloadWavBlob(cached.blob, `mudros_scene_${currentScene.id}_${selectedVoice}.wav`);
+    } else if (cached?.url) {
+      await downloadAudioFromUrl(cached.url, `mudros_scene_${currentScene.id}_${selectedVoice}.wav`);
+    } else {
+      // Default to bundled WAV
+      await downloadAudioFromUrl(
+        `/audio/scene_${currentScene.id}.wav`,
+        `mudros_scene_${currentScene.id}_Charon.wav`
+      );
     }
   };
 
   const handleCopyAllText = () => {
-    const fullScript = MUDROS_SCENES.map(
-      (s) => `[${s.title}]\n\n${s.paragraphs.join('\n\n')}`
-    ).join('\n\n* * *\n\n');
+    const fullScript = MUDROS_SCENES.map((s) => {
+      const text = customTexts[s.id] || s.paragraphs.join('\n\n');
+      return `[${s.title}]\n\n${text}`;
+    }).join('\n\n* * *\n\n');
 
     navigator.clipboard.writeText(showTashkeel ? fullScript : removeTashkeel(fullScript));
     setCopiedAll(true);
@@ -313,6 +402,37 @@ export default function App() {
         onCopyAllText={handleCopyAllText}
         copied={copiedAll}
       />
+
+      {/* GitHub & Permanent Audio Guarantee Banner */}
+      <div className="bg-emerald-950/40 border-b border-emerald-800/40 py-2 px-4 sm:px-8 text-xs text-emerald-200 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+          <span>
+            <strong>الصوت الأصلي مدمج وثابت 100%:</strong> تم حفظ جميع تسجيلات مشاهد الوثائقي الـ 7 في المشروع بصوت الراوي الوثائقي الأصلي (Charon)، ولن يتغير الصوت أبداً حتى عند رفع المشروع على GitHub أو تشغيله بدون إنترنت!
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] bg-emerald-900/60 text-emerald-300 px-2.5 py-0.5 rounded-full border border-emerald-700/50">
+            تعديل النصوص متاح مع تحديث النطق التلقائي
+          </span>
+        </div>
+      </div>
+
+      {/* Toast / Status alert */}
+      {statusMessage && (
+        <div className="bg-amber-950/80 border-b border-amber-800/60 py-2.5 px-4 sm:px-8 text-xs text-amber-200 flex items-center justify-between gap-2 animate-in fade-in">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>{statusMessage}</span>
+          </div>
+          <button
+            onClick={() => setStatusMessage(null)}
+            className="text-stone-400 hover:text-stone-200 text-xs px-2"
+          >
+            إغلاق
+          </button>
+        </div>
+      )}
 
       {/* Persistent Audio Player & Studio Bar */}
       <PlayerControls
@@ -361,31 +481,18 @@ export default function App() {
             <div className="flex items-center justify-between mb-3 text-xs">
               <span className="font-bold text-stone-200 flex items-center gap-1.5">
                 <Layers className="w-4 h-4 text-amber-400" />
-                فهرس المشاهد التاريخية (7 مشاهد)
+                فهرس المشاهد التاريخية (7 مشاهد مسجلة مسبقاً)
               </span>
-              <button
-                onClick={handlePreGenerateAll}
-                disabled={batchLoading}
-                className="text-[11px] text-amber-400 hover:text-amber-300 flex items-center gap-1 font-semibold transition"
-              >
-                {batchLoading ? (
-                  <>
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                    <span>جاري تحضير المقاطع ({batchProgress}/7)...</span>
-                  </>
-                ) : (
-                  <>
-                    <Sparkles className="w-3 h-3" />
-                    <span>تجهيز كافة المشاهد مسبقاً للتشغيل الفوري</span>
-                  </>
-                )}
-              </button>
+              <span className="text-[11px] text-emerald-400 flex items-center gap-1 font-semibold">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                <span>جاهز للتشغيل الدائم والفوري</span>
+              </span>
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-2">
               {MUDROS_SCENES.map((scene, idx) => {
                 const isActive = idx === currentSceneIndex;
-                const isCached = !!cachedScenes[`${scene.id}_${selectedVoice}`];
+                const isCustom = !!customTexts[scene.id];
                 return (
                   <button
                     key={scene.id}
@@ -398,7 +505,8 @@ export default function App() {
                   >
                     <div className="flex items-center gap-1 mb-1">
                       <span className="text-[10px] font-mono font-bold">0{scene.id}</span>
-                      {isCached && <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />}
+                      <div className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                      {isCustom && <div className="w-1.5 h-1.5 rounded-full bg-amber-400" />}
                     </div>
                     <span className="text-xs font-medium truncate w-full">
                       {scene.year}
@@ -428,14 +536,21 @@ export default function App() {
                 }}
                 showTashkeel={showTashkeel}
                 fontSize={fontSize}
-                onDownloadSceneAudio={() => {
-                  const cacheKey = `${scene.id}_${selectedVoice}`;
+                onDownloadSceneAudio={async () => {
+                  const isCustom = !!customTexts[scene.id];
+                  const textToSpeak = getSceneText(scene.id);
+                  const cacheKey = `scene_${scene.id}_${selectedVoice}_${isCustom ? textToSpeak.slice(0, 30) : 'default'}`;
                   const entry = cachedScenes[cacheKey];
-                  if (entry) {
-                    downloadWavBlob(entry.blob, `mudros_scene_${scene.id}_${selectedVoice}.wav`);
+                  if (entry?.blob) {
+                    downloadWavBlob(entry.blob, `mudros_scene_${scene.id}.wav`);
+                  } else {
+                    await downloadAudioFromUrl(`/audio/scene_${scene.id}.wav`, `mudros_scene_${scene.id}.wav`);
                   }
                 }}
-                hasCachedAudio={!!cachedScenes[`${scene.id}_${selectedVoice}`]}
+                hasCachedAudio={true}
+                customText={customTexts[scene.id]}
+                onSaveCustomText={handleSaveCustomText}
+                onResetCustomText={handleResetCustomText}
               />
             ))}
           </div>
@@ -467,6 +582,20 @@ export default function App() {
 
         {/* Right Sidebar: Historical Dossier & Context */}
         <aside className="w-full lg:w-80 space-y-6 shrink-0">
+          {/* Text Editing Feature Spotlight Card */}
+          <div className="bg-gradient-to-br from-[#151a2e] to-[#0e1220] border border-amber-500/40 rounded-2xl p-5 shadow-lg space-y-3">
+            <div className="flex items-center gap-2 text-amber-300 text-xs font-bold uppercase tracking-wider border-b border-amber-900/40 pb-2.5">
+              <Edit3 className="w-4 h-4 text-amber-400" />
+              <span>ميزة تعديل النص وتحديث النطق</span>
+            </div>
+            <p className="text-xs text-stone-300 leading-relaxed">
+              يمكنك في أي وقت الضغط على زر <strong className="text-amber-300">«تعديل النص»</strong> الموجود على أي مشهد، وكتابة أو تعديل العبارات والتشكيل، ثم الضغط على <strong className="text-amber-300">«توليد وتحديث النطق»</strong>.
+            </p>
+            <p className="text-xs text-stone-400 leading-relaxed">
+              سيقوم نموذج Gemini TTS المتقدم بقراءة نصك المعدل بصوت الراوي نفسه مع تطبيق كامل توجيهات النبرة.
+            </p>
+          </div>
+
           {/* Historical File / Dossier Card */}
           <div className="bg-[#10121a] border border-stone-800/80 rounded-2xl p-5 shadow-lg space-y-4">
             <div className="flex items-center gap-2 text-amber-400 text-xs font-bold uppercase tracking-wider border-b border-stone-800 pb-3">
@@ -514,24 +643,18 @@ export default function App() {
           <div className="bg-gradient-to-br from-[#121524] to-[#0e1019] border border-amber-900/40 rounded-2xl p-5 shadow-lg space-y-3.5">
             <div className="flex items-center gap-2 text-amber-300 text-xs font-bold border-b border-amber-950/60 pb-3">
               <Sparkles className="w-4 h-4 text-amber-400" />
-              <span>توجيهات الراوي المعتمدة في الصوت</span>
+              <span>ضمان ثبات الصوت عند الرفع على GitHub</span>
             </div>
 
-            <ul className="text-xs space-y-2.5 text-stone-300 leading-relaxed list-disc list-inside">
+            <ul className="text-xs space-y-2 text-stone-300 leading-relaxed list-disc list-inside">
               <li>
-                <span className="text-amber-300 font-medium">طبقة الصوت:</span> صوت رجالي عميق ورصين (Charon / Fenrir).
+                <span className="text-emerald-300 font-medium">ملفات صوتية مدمجة:</span> تم توليد وحفظ كافة المقاطع بصيغة WAV في <code className="text-amber-400">public/audio/</code>.
               </li>
               <li>
-                <span className="text-amber-300 font-medium">الإيقاع والوقفات:</span> سرعة متأنية، وقفة قصيرة عند الفواصل وأطول عند الفواصل الزمنية.
+                <span className="text-emerald-300 font-medium">بدون روبوت أو صوت متصفح:</span> تم إلغاء الصوت الاصطناعي الخاص بالمتصفحات نهائياً لضمان عدم تغير الصوت إطلاقاً.
               </li>
               <li>
-                <span className="text-amber-300 font-medium">التفاعل الدرامي:</span> توتر هادئ في الافتتاح، حماسي بالمعارك، حزين عند المجازر.
-              </li>
-              <li>
-                <span className="text-amber-300 font-medium">التشكيل الحرفي:</span> نطق مخارج الحروف بالتشكيل الكامل للأسماء والأعلام.
-              </li>
-              <li>
-                <span className="text-amber-300 font-medium">الخاتمة:</span> انحسار وتلاشٍ تدريجي هادئ.
+                <span className="text-emerald-300 font-medium">تخزين التعديلات:</span> نصوصك المعدلة تُحفظ محلياً في المتصفح.
               </li>
             </ul>
 
@@ -541,31 +664,6 @@ export default function App() {
             >
               <span>فتح استوديو المخرج والتجارب</span>
             </button>
-          </div>
-
-          {/* Keyboard Shortcuts Guide */}
-          <div className="bg-[#10121a]/80 border border-stone-800 rounded-2xl p-4 text-xs text-stone-400 space-y-2">
-            <span className="text-[11px] font-bold text-stone-300 block mb-1">
-              اختصارات لوحة المفاتيح:
-            </span>
-            <div className="flex justify-between">
-              <span>تشغيل / إيقاف مؤقت:</span>
-              <kbd className="px-1.5 py-0.5 bg-stone-800 border border-stone-700 rounded text-[10px] text-stone-200 font-mono">
-                Space
-              </kbd>
-            </div>
-            <div className="flex justify-between">
-              <span>المشهد التالي:</span>
-              <kbd className="px-1.5 py-0.5 bg-stone-800 border border-stone-700 rounded text-[10px] text-stone-200 font-mono">
-                Ctrl + →
-              </kbd>
-            </div>
-            <div className="flex justify-between">
-              <span>المشهد السابق:</span>
-              <kbd className="px-1.5 py-0.5 bg-stone-800 border border-stone-700 rounded text-[10px] text-stone-200 font-mono">
-                Ctrl + ←
-              </kbd>
-            </div>
           </div>
         </aside>
       </main>

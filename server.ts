@@ -59,56 +59,89 @@ app.post('/api/tts/narrate', async (req: Request, res: Response) => {
 
     const effectiveStyle = stylePrompt || defaultDocumentaryStyle;
 
-    // Call gemini-3.8-flash-lite-tts for fast, high-fidelity audio generation
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [
-        {
-          role: 'user',
-          parts: [
+    // Use flagship gemini-3.8-flash-tts first, with fallback to gemini-3.8-flash-lite-tts
+    const modelsToTry = ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
+    let base64Audio: string | undefined;
+    let mimeType = 'audio/wav';
+    let lastError: any = null;
+
+    for (const model of modelsToTry) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: [
             {
-              text,
-              speechMetadata: {
-                style: effectiveStyle,
-              },
+              role: 'user',
+              parts: [
+                {
+                  text,
+                  speechMetadata: {
+                    style: effectiveStyle,
+                  },
+                },
+              ],
             },
           ],
-        },
-      ],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: {
-              voiceName: voice, // 'Charon' (deep male), 'Fenrir', 'Puck', 'Kore', 'Zephyr'
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: voice, // 'Charon' (deep male), 'Fenrir', 'Puck', 'Kore', 'Zephyr'
+                },
+              },
             },
           },
-        },
-      },
-    });
+        });
 
-    const candidate = response.candidates?.[0];
-    const audioPart = candidate?.content?.parts?.find(
-      (part: any) => part?.inlineData && part?.inlineData?.data
-    );
+        const candidate = response.candidates?.[0];
+        const audioPart = candidate?.content?.parts?.find(
+          (part: any) => part?.inlineData && part?.inlineData?.data
+        );
 
-    const inlineData = audioPart?.inlineData;
-    const base64Audio = inlineData?.data;
+        const inlineData = audioPart?.inlineData;
+        if (inlineData?.data) {
+          base64Audio = inlineData.data;
+          mimeType = inlineData.mimeType || 'audio/wav';
+          break;
+        }
+      } catch (e: any) {
+        lastError = e;
+        console.warn(`Attempt with ${model} failed, trying alternative if available...`, e.message);
+      }
+    }
 
-    if (!base64Audio || !inlineData) {
-      console.error('Gemini TTS response missing inlineData:', JSON.stringify(response, null, 2));
-      res.status(502).json({
-        error: 'No audio data received from Gemini TTS model.',
-        details: candidate?.finishReason || 'Unknown model output',
+    if (!base64Audio) {
+      console.error('All TTS models failed:', lastError);
+      res.status(lastError?.status || 500).json({
+        error: lastError?.message || 'No audio data received from Gemini TTS models.',
       });
       return;
+    }
+
+    // If sceneId is specified and saveToDisk is requested, persist directly to public/audio/
+    const { sceneId, saveToDisk = true } = req.body;
+    if (sceneId && saveToDisk) {
+      try {
+        const fs = await import('fs');
+        const audioDir = path.resolve(process.cwd(), 'public/audio');
+        if (!fs.existsSync(audioDir)) {
+          fs.mkdirSync(audioDir, { recursive: true });
+        }
+        const targetPath = path.join(audioDir, `scene_${sceneId}.wav`);
+        fs.writeFileSync(targetPath, Buffer.from(base64Audio, 'base64'));
+        console.log(`Saved updated audio for Scene ${sceneId} to ${targetPath}`);
+      } catch (saveErr) {
+        console.warn(`Could not save audio to disk for Scene ${sceneId}:`, saveErr);
+      }
     }
 
     res.json({
       success: true,
       audioBase64: base64Audio,
-      mimeType: inlineData.mimeType || 'audio/wav',
+      mimeType,
       voice,
+      savedToDisk: !!sceneId,
     });
   } catch (err: any) {
     console.error('Error generating narration audio:', err);

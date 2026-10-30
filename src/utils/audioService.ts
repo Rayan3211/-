@@ -4,21 +4,56 @@ export interface NarrationResponse {
   mimeType?: string;
   voice?: string;
   error?: string;
+  savedToDisk?: boolean;
 }
 
-// In-memory cache for generated audio blobs: key = `${sceneId}_${voice}`
-const audioCache = new Map<string, { blob: Blob; url: string; base64: string }>();
+// In-memory cache for generated or loaded audio blobs: key = `${sceneId}_${voice}` or custom
+const audioCache = new Map<string, { blob?: Blob; url: string; base64?: string }>();
+
+/**
+ * Returns audio for a scene.
+ * If isCustomEdited is false and default voice is selected, loads the pre-rendered studio WAV (/audio/scene_{id}.wav).
+ * Otherwise, requests a freshly generated audio from the Gemini TTS server.
+ */
+export async function getSceneAudio(
+  sceneId: number,
+  cleanText: string,
+  voice: string = 'Charon',
+  stylePrompt?: string,
+  isCustomEdited: boolean = false
+): Promise<{ url: string; blob?: Blob }> {
+  const cacheKey = `scene_${sceneId}_${voice}_${isCustomEdited ? cleanText.slice(0, 30) : 'default'}`;
+
+  if (audioCache.has(cacheKey)) {
+    return audioCache.get(cacheKey)!;
+  }
+
+  // If using the official documentary script and Charon voice, load the bundled permanent WAV
+  if (!isCustomEdited && (voice === 'Charon' || !voice)) {
+    try {
+      const staticUrl = `/audio/scene_${sceneId}.wav`;
+      const headCheck = await fetch(staticUrl, { method: 'HEAD' });
+      if (headCheck.ok) {
+        const entry = { url: staticUrl };
+        audioCache.set(cacheKey, entry);
+        return entry;
+      }
+    } catch {
+      // Fall through to server generation if file not found
+    }
+  }
+
+  // Generate on server with Gemini TTS
+  return await fetchNarrationAudio(cleanText, voice, stylePrompt, cacheKey, sceneId);
+}
 
 export async function fetchNarrationAudio(
   text: string,
   voice: string = 'Charon',
   stylePrompt?: string,
-  cacheKey?: string
+  cacheKey?: string,
+  sceneId?: number
 ): Promise<{ url: string; blob: Blob; base64: string }> {
-  if (cacheKey && audioCache.has(cacheKey)) {
-    return audioCache.get(cacheKey)!;
-  }
-
   const res = await fetch('/api/tts/narrate', {
     method: 'POST',
     headers: {
@@ -28,17 +63,19 @@ export async function fetchNarrationAudio(
       text,
       voice,
       stylePrompt,
+      sceneId,
+      saveToDisk: !!sceneId,
     }),
   });
 
   if (!res.ok) {
     const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.error || `HTTP ${res.status}: Failed to generate narration`);
+    throw new Error(errorData.error || `HTTP ${res.status}: فشل توليد الصوت من نموذج Gemini`);
   }
 
   const data: NarrationResponse = await res.json();
   if (!data.audioBase64) {
-    throw new Error('No audio data received from server');
+    throw new Error('لم يتم استلام بيانات صوتية من الخادم');
   }
 
   // Convert base64 to Blob
@@ -73,42 +110,12 @@ export function downloadWavBlob(blob: Blob, filename: string = 'mudros-narration
   }, 1000);
 }
 
-/**
- * Browser SpeechSynthesis fallback in case API key is missing or offline
- */
-export function playWebSpeechFallback(
-  text: string,
-  rate: number = 0.85,
-  onEnd?: () => void
-): SpeechSynthesisUtterance | null {
-  if (!('speechSynthesis' in window)) return null;
-
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = 'ar-SA';
-  utterance.rate = rate;
-  utterance.pitch = 0.85; // slightly lower pitch for documentary tone
-
-  // Attempt to select an Arabic voice
-  const voices = window.speechSynthesis.getVoices();
-  const arabicVoice = voices.find((v) => v.lang.startsWith('ar') && v.name.toLowerCase().includes('male'))
-    || voices.find((v) => v.lang.startsWith('ar'))
-    || voices[0];
-
-  if (arabicVoice) {
-    utterance.voice = arabicVoice;
-  }
-
-  if (onEnd) {
-    utterance.onend = onEnd;
-  }
-
-  window.speechSynthesis.speak(utterance);
-  return utterance;
-}
-
-export function stopWebSpeech() {
-  if ('speechSynthesis' in window) {
-    window.speechSynthesis.cancel();
+export async function downloadAudioFromUrl(url: string, filename: string) {
+  try {
+    const response = await fetch(url);
+    const blob = await response.blob();
+    downloadWavBlob(blob, filename);
+  } catch (err) {
+    console.error('Failed to download audio file:', err);
   }
 }
